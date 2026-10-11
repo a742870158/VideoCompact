@@ -66,15 +66,19 @@ class VideoCompactApp:
         options.pack(fill="x", **pad)
 
         ttk.Label(options, text="输出模式:").grid(row=0, column=0, sticky="w", padx=8, pady=8)
-        self.mode_var = tk.StringVar(value="reencode")
+        self.mode_var = tk.StringVar(value="smart")
+        ttk.Radiobutton(
+            options, text="智能（静止多则无损，否则重编码）",
+            variable=self.mode_var, value="smart",
+        ).grid(row=0, column=1, sticky="w", padx=4)
         ttk.Radiobutton(
             options, text="重编码（体积最小，画质极小损失）",
             variable=self.mode_var, value="reencode",
-        ).grid(row=0, column=1, sticky="w", padx=4)
+        ).grid(row=0, column=2, sticky="w", padx=4)
         ttk.Radiobutton(
             options, text="无损裁剪（画质与源一致，省得少）",
             variable=self.mode_var, value="lossless",
-        ).grid(row=0, column=2, sticky="w", padx=4)
+        ).grid(row=0, column=3, sticky="w", padx=4)
 
         paths = ttk.LabelFrame(self.root, text="目录设置")
         paths.pack(fill="x", **pad)
@@ -183,7 +187,7 @@ class VideoCompactApp:
         self.static_speed_spin.configure(state=state)
 
     def _update_mode_visibility(self):
-        if self.mode_var.get() == "reencode":
+        if self.mode_var.get() in ("reencode", "smart"):
             for row in (self.static_min_row, self.segment_mode_row, self.static_speed_row):
                 row.pack(fill="x", padx=8, pady=6)
             pack_args = {"fill": "x", "padx": 8, "pady": 6}
@@ -310,9 +314,15 @@ class VideoCompactApp:
         self.append_log(f"开始: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         self.append_log(f"输入: {input_dir}")
         self.append_log(f"输出: {output_dir}")
-        self.append_log(f"模式: {'无损裁剪' if cv.OUTPUT_MODE == 'lossless' else '重编码'}")
+        self.append_log(
+            "模式: " + {
+                "lossless": "无损裁剪",
+                "reencode": "重编码",
+                "smart": "智能（自动选择 无损 / 重编码）",
+            }.get(cv.OUTPUT_MODE, cv.OUTPUT_MODE)
+        )
         self.append_log(f"静止判定阈值: {static_min}s")
-        if cv.OUTPUT_MODE == "reencode":
+        if cv.OUTPUT_MODE in ("reencode", "smart"):
             self.append_log(
                 f"静止段处理: {'直接裁掉' if cv.STATIC_SEGMENT_MODE == 'drop' else f'倍速保留 x{static_speed}'}"
             )

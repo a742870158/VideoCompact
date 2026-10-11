@@ -60,7 +60,13 @@ STATIC_SEGMENT_MODE = "drop"
 # "lossless" = 无损裁剪：不重编码，直接流复制，只能在关键帧处切。
 #              画质与源 100% 一致、速度极快，但静止段只能按 GOP 整数倍删除，
 #              会有残留静止、省得少。小米摄像机 GOP 固定 6 秒，务必知晓此限制。
-OUTPUT_MODE = "reencode"
+# "smart"    = 智能（默认）：先算无损实际能删掉的比例，够多就走无损（零损失且更小），
+#              删不动就走重编码。判据见 SMART_LOSSLESS_MIN_REMOVAL。
+OUTPUT_MODE = "smart"
+
+# 智能模式判据：无损实际可删时长占比达到该阈值就用无损裁切，否则重编码。
+# 无损删不动时体积≈源，此时重编码更划算；10% 是实测交叉点附近偏保守的取值。
+SMART_LOSSLESS_MIN_REMOVAL = 0.10
 
 # 仅用于静止检测，不参与最终输出。
 # 先降采样到 5fps，再缩小并轻微模糊，能明显减少大批量处理的检测成本。
@@ -1064,6 +1070,18 @@ def build_lossless_kept_ranges(segments, keyframes, duration):
     return cleaned
 
 
+def plan_lossless(segments, keyframes, duration):
+    """按关键帧对齐算出无损可保留区间，以及实际可删时长占比。
+
+    返回 (kept_ranges, kept_duration, removable_ratio)。
+    removed = duration - kept_duration，反映无损真正能省下的比例。
+    """
+    kept_ranges = build_lossless_kept_ranges(segments, keyframes, duration)
+    kept_duration = sum(end - start for start, end in kept_ranges)
+    removable = (duration - kept_duration) / duration if duration > 0 else 0.0
+    return kept_ranges, kept_duration, removable
+
+
 def build_lossless_part_command(video_path, part_path, start, end):
     duration = end - start
     return [
@@ -1229,10 +1247,12 @@ def encode_one_video(video_path):
             f"{summary['static_count']} 段静止区间, "
             f"合计 {summary['static_input_total']:.2f}s -> {summary['static_output_total']:.2f}s"
         )
-        vlog(
-            "    - 输出模式: "
-            + ("无损裁剪（流复制，只能在关键帧处切）" if OUTPUT_MODE == "lossless" else "重编码（CQ + 码率上限）")
-        )
+        mode_labels = {
+            "reencode": "重编码（CQ + 码率上限）",
+            "lossless": "无损裁剪（流复制，只能在关键帧处切）",
+            "smart": "智能（按无损可删比例自动选择 无损 / 重编码）",
+        }
+        vlog("    - 输出模式: " + mode_labels.get(OUTPUT_MODE, OUTPUT_MODE))
 
         if record.get("all_static"):
             with open(empty_marker_path(filename), "w", encoding="utf-8") as handle:
@@ -1245,15 +1265,25 @@ def encode_one_video(video_path):
             vlog("    - 未发现超过 3 秒的静止区间，已直接复制源文件到 output。")
             return "copied_no_static"
 
-        if OUTPUT_MODE == "lossless":
+        duration = record.get("duration", 0.0)
+        use_lossless = OUTPUT_MODE == "lossless"
+        if OUTPUT_MODE in ("lossless", "smart"):
             keyframes = get_keyframe_times(video_path)
-            kept_ranges = build_lossless_kept_ranges(segments, keyframes, record.get("duration", 0.0))
-            kept_duration = sum(end - start for start, end in kept_ranges)
-            removed_duration = record.get("duration", 0.0) - kept_duration
+            kept_ranges, kept_duration, removable = plan_lossless(segments, keyframes, duration)
             vlog(
-                f"    - 无损可删静止约 {removed_duration:.2f}s"
-                f"（GOP 对齐，剩余静止保留在原速）"
+                f"    - 无损可删静止约 {duration - kept_duration:.2f}s"
+                f"（占 {removable * 100:.1f}%，GOP 对齐，剩余静止保留在原速）"
             )
+            if OUTPUT_MODE == "smart":
+                use_lossless = removable >= SMART_LOSSLESS_MIN_REMOVAL
+                vlog(
+                    f"    - 智能判定: 无损可删 {removable * 100:.1f}% "
+                    + ("≥" if use_lossless else "<")
+                    + f" 阈值 {SMART_LOSSLESS_MIN_REMOVAL * 100:.0f}%，采用"
+                    + ("无损裁剪。" if use_lossless else "重编码。")
+                )
+
+        if use_lossless:
             if kept_duration <= 0:
                 shutil.copy2(video_path, output_path)
                 vlog("    - 无法无损删除任何区间，已直接复制源文件到 output。")
@@ -1271,7 +1301,7 @@ def encode_one_video(video_path):
             for s in effective_segments
         )
         maxrate = compute_encode_maxrate(
-            record.get("source_video_bitrate", 0), record.get("duration", 0.0), kept_duration
+            record.get("source_video_bitrate", 0), duration, kept_duration
         )
 
         with ENCODE_SEMAPHORE:
