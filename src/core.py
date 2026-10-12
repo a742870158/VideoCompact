@@ -1084,24 +1084,23 @@ def plan_lossless(segments, keyframes, duration):
 
 def build_lossless_part_command(video_path, part_path, start, end):
     duration = end - start
-    return [
-        FFMPEG_PATH,
-        "-hide_banner",
-        "-y",
-        "-ss",
-        format_seconds(start),
-        "-t",
-        format_seconds(duration),
-        "-i",
-        video_path,
-        "-map",
-        "0",
-        "-c",
-        "copy",
-        "-avoid_negative_ts",
-        "make_zero",
-        part_path,
-    ]
+    cmd = [FFMPEG_PATH, "-hide_banner", "-y"]
+    if start > 0.001:
+        cmd.extend(["-ss", format_seconds(start)])
+    cmd.extend(
+        [
+            "-t",
+            format_seconds(duration),
+            "-i",
+            video_path,
+            "-map",
+            "0",
+            "-c",
+            "copy",
+            part_path,
+        ]
+    )
+    return cmd
 
 
 def render_lossless(video_path, output_path, kept_ranges, logger):
