@@ -42,8 +42,10 @@ class VideoCompactApp:
         self._running = False
 
         root.title("小米摄像机录像压缩工具")
-        root.geometry("920x780")
-        root.minsize(760, 560)
+        scale = self._get_dpi_scale()
+        width, height = self._fit_to_screen(int(780 * scale), int(560 * scale))
+        root.geometry(f"{width}x{height}")
+        root.minsize(*self._fit_to_screen(int(720 * scale), int(520 * scale)))
 
         icon_path = resource_path("app_icon.ico")
         if os.path.exists(icon_path):
@@ -57,6 +59,31 @@ class VideoCompactApp:
         root.protocol("WM_DELETE_WINDOW", self.on_close)
         root.bind("<Unmap>", self.on_unmap)
         root.after(100, self._drain_log_queue)
+
+    @staticmethod
+    def _get_dpi_scale():
+        """返回系统 DPI 缩放因子（96 DPI = 100%）。需在 SetProcessDpiAwareness 之后调用。"""
+        try:
+            import ctypes
+            dpi = ctypes.windll.user32.GetDpiForSystem()
+            if dpi and dpi > 0:
+                return dpi / 96.0
+        except Exception:
+            pass
+        return 1.0
+
+    @staticmethod
+    def _fit_to_screen(w, h):
+        """限制窗口不超过屏幕（物理像素）的 90%，防止高缩放下超出屏幕。"""
+        try:
+            import ctypes
+            user32 = ctypes.windll.user32
+            sw, sh = user32.GetSystemMetrics(0), user32.GetSystemMetrics(1)
+            if sw > 0 and sh > 0:
+                return min(w, int(sw * 0.9)), min(h, int(sh * 0.9))
+        except Exception:
+            pass
+        return w, h
 
     # ---------------- UI ----------------
     def _build_ui(self):
