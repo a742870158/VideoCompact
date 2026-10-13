@@ -107,6 +107,31 @@ class VideoCompactApp:
             variable=self.mode_var, value="lossless",
         ).grid(row=0, column=3, sticky="w", padx=4)
 
+        # 视频合并卡片（处理选项下方）
+        merge_frame = ttk.LabelFrame(self.root, text="视频合并")
+        merge_frame.pack(fill="x", **pad)
+        self.merge_frame = merge_frame
+
+        self.merge_row = ttk.Frame(merge_frame)
+        self.merge_row.pack(fill="x", padx=8, pady=8)
+
+        self.merge_var = tk.BooleanVar(value=bool(cv.MERGE_BY_DAY))
+        ttk.Checkbutton(
+            self.merge_row,
+            text="按天合并（任务结束后自动合并）",
+            variable=self.merge_var,
+            command=self._update_merge_visibility,
+        ).pack(side="left")
+
+        # 「删除源文件」与「按天合并」同一行，仅在勾选「按天合并」时出现，默认不勾选。
+        self.delete_source_var = tk.BooleanVar(value=bool(cv.DAILY_DELETE_SOURCE))
+        self.delete_source_check = ttk.Checkbutton(
+            self.merge_row,
+            text="合并后删除源文件（仅删除 output 里已合并的 compact_*）",
+            variable=self.delete_source_var,
+        )
+        self._update_merge_visibility()
+
         paths = ttk.LabelFrame(self.root, text="目录设置")
         paths.pack(fill="x", **pad)
         paths.columnconfigure(1, weight=1)
@@ -132,6 +157,8 @@ class VideoCompactApp:
         self.pause_btn.pack(side="left", padx=4)
         self.stop_btn = ttk.Button(controls, text="停止", command=self.stop, state="disabled")
         self.stop_btn.pack(side="left", padx=4)
+        self.merge_btn = ttk.Button(controls, text="手动按天合并", command=self.start_merge)
+        self.merge_btn.pack(side="left", padx=4)
         self.status_var = tk.StringVar(value="就绪")
         ttk.Label(controls, textvariable=self.status_var).pack(side="right", padx=8)
 
@@ -212,6 +239,13 @@ class VideoCompactApp:
     def _update_segment_mode_state(self):
         state = "normal" if self.segment_mode_var.get() == "speedup" else "disabled"
         self.static_speed_spin.configure(state=state)
+
+    def _update_merge_visibility(self):
+        # 「删除源文件」与「按天合并」同一行，只在勾选「按天合并」时显示。
+        if self.merge_var.get():
+            self.delete_source_check.pack(side="left", padx=(16, 0))
+        else:
+            self.delete_source_check.pack_forget()
 
     def _update_mode_visibility(self):
         if self.mode_var.get() in ("reencode", "smart"):
@@ -329,10 +363,13 @@ class VideoCompactApp:
         cv.STATIC_MIN_SECONDS = static_min
         cv.STATIC_SEGMENT_MODE = self.segment_mode_var.get()
         cv.STATIC_SPEED = static_speed
+        cv.MERGE_BY_DAY = bool(self.merge_var.get())
+        cv.DAILY_DELETE_SOURCE = bool(self.delete_source_var.get())
         cv.CONTROL.reset()
 
         self._running = True
         self.start_btn.configure(state="disabled")
+        self.merge_btn.configure(state="disabled")
         self.pause_btn.configure(state="normal", text="暂停")
         self.stop_btn.configure(state="normal")
         self.status_var.set("运行中")
@@ -353,6 +390,13 @@ class VideoCompactApp:
             self.append_log(
                 f"静止段处理: {'直接裁掉' if cv.STATIC_SEGMENT_MODE == 'drop' else f'倍速保留 x{static_speed}'}"
             )
+        if cv.MERGE_BY_DAY:
+            self.append_log(
+                "按天合并: 开启"
+                + ("，合并后删除源文件" if cv.DAILY_DELETE_SOURCE else "")
+            )
+        else:
+            self.append_log("按天合并: 关闭")
         self.append_log("=" * 40)
 
         self.worker = threading.Thread(target=self._run_worker, daemon=True)
@@ -370,9 +414,73 @@ class VideoCompactApp:
         finally:
             self.action_queue.put("finished")
 
+    def start_merge(self):
+        if self._running:
+            return
+        input_dir = self.input_var.get().strip()
+        output_dir = self.output_var.get().strip()
+        if not input_dir:
+            messagebox.showerror("错误", "请选择输入目录。")
+            return
+        if not output_dir:
+            messagebox.showerror("错误", "请选择输出目录。")
+            return
+        if not os.path.isfile(cv.FFMPEG_PATH) or not os.path.isfile(cv.FFPROBE_PATH):
+            messagebox.showerror("错误", f"未找到 ffmpeg/ffprobe:\n{cv.FFMPEG_PATH}\n{cv.FFPROBE_PATH}")
+            return
+        try:
+            os.makedirs(input_dir, exist_ok=True)
+            os.makedirs(output_dir, exist_ok=True)
+        except OSError as exc:
+            messagebox.showerror("错误", f"无法创建目录: {exc}")
+            return
+
+        has_video = any(
+            name.lower().endswith(".mp4") for name in os.listdir(input_dir)
+        )
+        if not has_video:
+            messagebox.showinfo(
+                "提示",
+                f"输入目录里还没有 mp4 文件：\n{input_dir}\n\n请把视频放进去后再开始合并。",
+            )
+            return
+
+        cv.INPUT_DIR = input_dir
+        cv.OUTPUT_DIR = output_dir
+        cv.CONTROL.reset()
+
+        self._running = True
+        self.start_btn.configure(state="disabled")
+        self.merge_btn.configure(state="disabled")
+        self.pause_btn.configure(state="normal", text="暂停")
+        self.stop_btn.configure(state="normal")
+        self.status_var.set("合并中")
+
+        self.append_log("=" * 40)
+        self.append_log(f"开始合并: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        self.append_log(f"输入: {input_dir}")
+        self.append_log(f"输出: {cv.daily_output_dir()}")
+        self.append_log("=" * 40)
+
+        self.worker = threading.Thread(target=self._run_merge_worker, daemon=True)
+        self.worker.start()
+
+    def _run_merge_worker(self):
+        try:
+            cv.run_merge_only()
+            cv.log("")
+            cv.log(">>> 合并完成。")
+        except cv.JobCancelled:
+            cv.log(">>> 已停止。")
+        except Exception as exc:
+            cv.log(f">>> 合并出错: {exc}")
+        finally:
+            self.action_queue.put("finished")
+
     def _on_finished(self):
         self._running = False
         self.start_btn.configure(state="normal")
+        self.merge_btn.configure(state="normal")
         self.pause_btn.configure(state="disabled", text="暂停")
         self.stop_btn.configure(state="disabled")
         self.status_var.set("就绪")

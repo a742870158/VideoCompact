@@ -137,8 +137,24 @@ ENCODE_MAX_MAXRATE = 100000000
 # 因此目标按额度打折，保证兜底方案总体积不超过源文件。
 ENCODE_CAPPED_TARGET_RATIO = 0.9
 
+# libopus 只支持这些采样率，其余（如 44100）会直接打不开编码器，需就近吸附。
+OPUS_SAMPLE_RATES = (8000, 12000, 16000, 24000, 48000)
+
 # 编码并发槽位（NVENC 限流，建议 1-2）。
 MAX_ENCODE_JOBS = 1
+
+# ---- 按天合并 ----
+# 是否在所有编码任务结束后自动按天合并（把同一天录制的视频拼成 output/daily/<日期>.mp4）。
+# 由 GUI 的「自动按天合并」卡片写回，默认关闭：不勾选「按天合并」就不会自动合并。
+MERGE_BY_DAY = False
+# 合并时视频流复制（无损、快），音频统一转成该编码，消除不同来源音频编码不一致的问题。
+DAILY_MERGE_AUDIO_CODEC = "aac"
+# 「合并后删除源文件」开关：自动合并成功时删除 output 里对应的 compact_*.mp4（由 GUI 写回）。
+# 仅作用于自动合并，手动「开始合并」永不删除输入文件。
+DAILY_DELETE_SOURCE = False
+
+# 从文件名提取「开始 / 结束」时间戳（14 位：YYYYMMDDHHMMSS），兼容 compact_ 前缀。
+TIMESTAMP_RE = re.compile(r"^(?P<stem>.*?)_(?P<start>\d{14})_(?P<end>\d{14})$")
 
 SHOWINFO_RE = re.compile(r"pts_time:(\d+(?:\.\d+)?)")
 # ========================================
@@ -790,6 +806,17 @@ def build_video_encoder_attempts(encoder, cq_value, maxrate):
     return [("CRF", args)]
 
 
+def _snap_opus_sample_rate(sample_rate):
+    """把采样率吸附到 libopus 支持的值（44100 -> 48000），否则编码器打不开。"""
+    try:
+        rate = int(sample_rate)
+    except (TypeError, ValueError):
+        return 48000
+    if rate in OPUS_SAMPLE_RATES:
+        return rate
+    return min(OPUS_SAMPLE_RATES, key=lambda candidate: abs(candidate - rate))
+
+
 def build_ffmpeg_command(video_path, output_path, audio_info, segments, video_encoder_args):
     has_audio = audio_info is not None
 
@@ -829,7 +856,7 @@ def build_ffmpeg_command(video_path, output_path, audio_info, segments, video_en
     )
 
     if has_audio:
-        sample_rate = audio_info.get("sample_rate", "48000")
+        sample_rate = _snap_opus_sample_rate(audio_info.get("sample_rate", "48000"))
         channels = audio_info.get("channels", 1)
         audio_bitrate = audio_info.get("bit_rate") or 64000
         cmd.extend(
@@ -1290,7 +1317,7 @@ def encode_one_video(video_path):
             with ENCODE_SEMAPHORE:
                 result = render_lossless(video_path, output_path, kept_ranges, vlog)
             vlog(f"    - 完成输出: {os.path.basename(output_path)}")
-            return result
+            return "lossless" if result == "encoded" else result
 
         effective_segments = get_effective_segments(segments)
         kept_duration = sum(s["end"] - s["start"] for s in effective_segments)
@@ -1310,7 +1337,7 @@ def encode_one_video(video_path):
                 progress_prefix=f"[{filename}]    - 编码",
             )
         vlog(f"    - 完成输出: {os.path.basename(output_path)}")
-        return result
+        return "reencoded" if result == "encoded" else result
     except JobCancelled:
         return "cancelled"
     finally:
@@ -1359,7 +1386,7 @@ def run_pipeline_tasks():
 
     log("[任务] 串行处理：每个任务 = 检测 + 编码，完成一个再进行下一个。")
 
-    stats = {"encoded": 0, "copied_fallback": 0, "copied_no_static": 0, "all_static": 0}
+    stats = {"lossless": 0, "reencoded": 0, "copied_fallback": 0, "copied_no_static": 0, "all_static": 0}
     failed_videos = []
     completed_count = 0
 
@@ -1397,7 +1424,8 @@ def run_pipeline_tasks():
     log(f"处理完成: {success_count}/{len(pending_video_files)}")
     log(f"总视频数: {len(video_files)}")
     log(f"已有输出跳过数: {skipped_output_count}")
-    log(f"编码压缩输出数: {stats['encoded']}")
+    log(f"无损裁剪输出数: {stats['lossless']}")
+    log(f"重编码输出数: {stats['reencoded']}")
     log(f"直接复制源文件数(合计): {stats['copied_no_static'] + stats['copied_fallback']}")
     log(f"  - 无静止区间直接复制: {stats['copied_no_static']}")
     log(f"  - 编码变大回退复制: {stats['copied_fallback']}")
@@ -1414,7 +1442,577 @@ def run_pipeline_tasks():
     log("=" * 36)
 
 
+# ================= 阶段三：按天合并 =================
+def daily_output_dir():
+    return os.path.join(OUTPUT_DIR, "daily")
+
+
+def parse_filename_times(filename):
+    """从文件名解析「开始 / 结束」时间戳，兼容 compact_ 前缀；解析失败返回 None。"""
+    stem = os.path.splitext(os.path.basename(filename))[0]
+    match = TIMESTAMP_RE.match(stem)
+    if not match:
+        return None
+    try:
+        start = datetime.strptime(match.group("start"), "%Y%m%d%H%M%S")
+        end = datetime.strptime(match.group("end"), "%Y%m%d%H%M%S")
+    except ValueError:
+        return None
+    return start, end
+
+
+def group_videos_by_day(video_paths):
+    """按开始时间所在的天分组。
+
+    返回 ({date: [(start, name, path), ...]}, 无法解析的路径列表)；
+    跨午夜的文件整体归到开始那天，组内按开始时间升序（同刻再按文件名）。
+    """
+    groups = {}
+    unparsed = []
+    for path in video_paths:
+        times = parse_filename_times(path)
+        if times is None:
+            unparsed.append(path)
+            continue
+        start = times[0]
+        groups.setdefault(start.date(), []).append((start, os.path.basename(path), path))
+    for day in groups:
+        groups[day].sort(key=lambda item: (item[0], item[1]))
+    return groups, unparsed
+
+
+def _reencode_concat_filter(inputs, want_audio, out_path, logger, expected_duration, progress_prefix):
+    """兜底：用 concat 滤镜逐段独立解码后整体重编码（复用编码器候选链），成功返回 True。
+
+    注意：这里不能用 concat demuxer + 重编码 —— demuxer 在输入编码不一致时
+    会静默丢弃后续片段的音频；concat 滤镜逐段独立解码则不受影响。
+    """
+    count = len(inputs)
+    if want_audio:
+        inputs_labels = "".join(f"[{index}:v][{index}:a]" for index in range(count))
+        filter_complex = f"{inputs_labels}concat=n={count}:v=1:a=1[v][a]"
+        map_args = ["-map", "[v]", "-map", "[a]"]
+    else:
+        inputs_labels = "".join(f"[{index}:v]" for index in range(count))
+        filter_complex = f"{inputs_labels}concat=n={count}:v=1:a=0[v]"
+        map_args = ["-map", "[v]"]
+
+    on_stdout = (
+        make_progress_handler(expected_duration, progress_prefix)
+        if expected_duration > 0
+        else None
+    )
+    while True:
+        with _ENCODER_LOCK:
+            encoder_index = _ENCODER_STATE["index"]
+        encoder = ENCODER_CANDIDATES[encoder_index]
+
+        succeeded = False
+        for label, video_args in build_video_encoder_attempts(encoder["name"], FIXED_CQ, 0):
+            cmd = [FFMPEG_PATH, "-hide_banner", "-y"]
+            for path in inputs:
+                cmd.extend(["-i", path])
+            cmd.extend(["-filter_complex", filter_complex])
+            cmd.extend(map_args)
+            cmd.extend(video_args)
+            cmd.extend(["-pix_fmt", "yuv420p", "-profile:v", "main", "-tag:v", "hvc1"])
+            if want_audio:
+                cmd.extend(["-c:a", DAILY_MERGE_AUDIO_CODEC])
+            else:
+                cmd.append("-an")
+            cmd.extend(["-movflags", "+faststart", "-progress", "pipe:1", "-nostats", out_path])
+            logger(f"    - 使用 {encoder['label']} {label} (CQ={FIXED_CQ}) 整体重编码合并中...")
+            returncode, stderr_text = run_streaming(cmd, on_stdout=on_stdout)
+            if (
+                returncode == 0
+                and os.path.isfile(out_path)
+                and os.path.getsize(out_path) > 0
+            ):
+                succeeded = True
+                break
+            logger(stderr_text)
+
+        if succeeded:
+            return True
+
+        with _ENCODER_LOCK:
+            can_fallback = (
+                _ENCODER_STATE["index"] == encoder_index
+                and encoder_index + 1 < len(ENCODER_CANDIDATES)
+            )
+            if can_fallback:
+                _ENCODER_STATE["index"] = encoder_index + 1
+        if not can_fallback:
+            return False
+        logger(f"    - {encoder['label']} 合并重编码失败，回退到下一个编码器。")
+
+
+def _probe_duration(path):
+    try:
+        return float(probe_media(path)["format"]["duration"])
+    except Exception:
+        return 0.0
+
+
+def _video_extradata(path):
+    """返回视频流的解码配置（VPS/SPS/PPS 等 extradata）；失败返回 None。
+
+    多段视频只有 extradata 完全一致时，才能安全地用 concat demuxer 流复制拼接
+    （MP4 每条轨只能存一份参数集，参数集不同会导致拼接后的码流解码错乱）。
+    """
+    cmd = [
+        FFPROBE_PATH, "-v", "error",
+        "-select_streams", "v:0",
+        "-show_streams", "-show_data",
+        "-of", "json", path,
+    ]
+    result = run_command(cmd, check=False)
+    if result.returncode != 0:
+        return None
+    try:
+        streams = json.loads(result.stdout).get("streams", [])
+    except ValueError:
+        return None
+    if not streams:
+        return None
+    return streams[0].get("extradata")
+
+
+def _media_signature(path):
+    """返回 (视频签名, 音频签名)，用于判断多段是否可直接流复制拼接。"""
+    info = probe_media(path)
+    video = pick_stream(info, "video")
+    audio = pick_stream(info, "audio")
+    video_sig = None
+    if video is not None:
+        video_sig = (
+            video.get("codec_name"),
+            video.get("width"),
+            video.get("height"),
+            video.get("pix_fmt"),
+            _video_extradata(path),
+        )
+    audio_sig = None
+    if audio is not None:
+        audio_sig = (
+            audio.get("codec_name"),
+            audio.get("sample_rate"),
+            audio.get("channels"),
+        )
+    return video_sig, audio_sig
+
+
+def _write_concat_list(list_path, paths):
+    with open(list_path, "w", encoding="utf-8") as handle:
+        for path in paths:
+            safe_path = os.path.abspath(path).replace("\\", "/")
+            handle.write(f"file '{safe_path}'\n")
+
+
+def _concat_copy(list_path, out_path, on_stdout=None):
+    cmd = [
+        FFMPEG_PATH, "-hide_banner", "-y",
+        "-f", "concat", "-safe", "0",
+        "-i", list_path,
+        "-c", "copy",
+        "-movflags", "+faststart",
+        "-progress", "pipe:1",
+        "-nostats",
+        out_path,
+    ]
+    return run_streaming(cmd, on_stdout=on_stdout)
+
+
+def _duration_ok(path, expected, tolerance=1.0):
+    """校验合并结果总时长、以及音轨时长是否接近预期，防止某段流被静默丢弃。"""
+    if not (os.path.isfile(path) and os.path.getsize(path) > 0):
+        return False
+    if expected <= 0:
+        return True
+    try:
+        info = probe_media(path)
+    except Exception:
+        return False
+    try:
+        if float(info["format"]["duration"]) < expected - tolerance:
+            return False
+    except (KeyError, TypeError, ValueError):
+        return False
+    for stream in info.get("streams", []):
+        if stream.get("codec_type") != "audio":
+            continue
+        try:
+            audio_duration = float(stream.get("duration", 0))
+        except (TypeError, ValueError):
+            audio_duration = 0.0
+        if audio_duration and audio_duration < expected - tolerance:
+            return False
+    return True
+
+
+def _is_benign_mux_warning(line):
+    """复用器层面的时间戳提示（拼接处 PTS/DTS 重复等），不是解码错误。"""
+    markers = (
+        "[null @",
+        "non monotonically increasing dts",
+        "Application provided invalid",
+    )
+    return any(marker in line for marker in markers)
+
+
+def _joins_ok(merged_path, boundaries, logger=None):
+    """在拼接点附近解码一小段，确认没有真正的解码错误（防止不同编码器拼接后码流错乱）。"""
+    for boundary in boundaries:
+        start = max(0.0, boundary - 0.5)
+        cmd = [FFMPEG_PATH, "-hide_banner", "-v", "error"]
+        if start > 0.001:
+            cmd.extend(["-ss", format_seconds(start)])
+        cmd.extend(["-t", "1.2", "-i", merged_path, "-map", "0:v:0", "-f", "null", "NUL"])
+        result = run_command(cmd, check=False)
+        if result.returncode != 0:
+            return False
+        for line in result.stderr.splitlines():
+            line = line.strip()
+            if not line or _is_benign_mux_warning(line):
+                continue
+            if logger is not None:
+                logger(f"    - 拼接处解码告警: {line}")
+            return False
+    return True
+
+
+def _target_audio_params(signatures):
+    """取各段中最高的采样率 / 声道数作为统一目标，尽量避免降质。"""
+    rates, channels = [], []
+    for _, audio_sig in signatures:
+        if audio_sig is None:
+            continue
+        if audio_sig[1]:
+            rates.append(int(audio_sig[1]))
+        if audio_sig[2]:
+            channels.append(int(audio_sig[2]))
+    return (max(rates) if rates else 48000), (max(channels) if channels else 1)
+
+
+def _normalize_all(paths, signatures, temp_dir, logger):
+    """把各段统一成一致的流布局：视频复制（无损）、音频统一转码、缺音频的补静音。
+
+    统一后各段可直接用 concat demuxer 流复制拼接。返回中间文件列表，失败返回 None。
+    """
+    want_audio = any(sig[1] is not None for sig in signatures)
+    target_sr, target_ch = _target_audio_params(signatures)
+    layout = "mono" if target_ch == 1 else "stereo"
+    normalized = []
+    for index, src in enumerate(paths):
+        dst = os.path.join(temp_dir, f"norm_{index:05d}.mp4")
+        has_audio = signatures[index][1] is not None
+        cmd = [FFMPEG_PATH, "-hide_banner", "-y", "-i", src]
+        if not want_audio:
+            cmd.extend(["-map", "0:v:0", "-c:v", "copy", "-an"])
+        elif has_audio:
+            cmd.extend(
+                [
+                    "-map", "0:v:0", "-map", "0:a:0", "-c:v", "copy",
+                    "-c:a", DAILY_MERGE_AUDIO_CODEC,
+                    "-ar", str(target_sr), "-ac", str(target_ch),
+                ]
+            )
+        else:
+            # 该段没有音频：补一路静音，保证与其它段流布局一致。
+            cmd.extend(
+                [
+                    "-f", "lavfi", "-i", f"anullsrc=r={target_sr}:cl={layout}",
+                    "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy",
+                    "-c:a", DAILY_MERGE_AUDIO_CODEC,
+                    "-ar", str(target_sr), "-ac", str(target_ch), "-shortest",
+                ]
+            )
+        cmd.extend(["-movflags", "+faststart", dst])
+        result = run_command(cmd, check=False)
+        if result.returncode != 0 or not os.path.isfile(dst) or os.path.getsize(dst) == 0:
+            if result.stderr:
+                logger(result.stderr)
+            return None
+        normalized.append(dst)
+    return normalized
+
+
+def _ts_join(paths, signatures, temp_dir, logger, out_path, expected_duration, progress_prefix, boundaries):
+    """无损 TS 拼接：各段参数集不同也能拼，且视频全程流复制（不重编码）。
+
+    原理：MP4 只能存一份视频参数集，参数集不同的片段直接拼会解码错乱；
+    先逐段统一音频并转成 MPEG-TS（把参数集内联进码流），再拼接，最后以
+    `-tag:v hev1`（允许参数集在码流中变化）回封装成 MP4。
+    """
+    normalized = _normalize_all(paths, signatures, temp_dir, logger)
+    if not normalized:
+        return False
+
+    ts_parts = []
+    for index, src in enumerate(normalized):
+        logger(f"    - 无损 TS 拼接：转封装 {index + 1}/{len(normalized)} 段...")
+        ts_path = os.path.join(temp_dir, f"part_{index:05d}.ts")
+        result = run_command(
+            [FFMPEG_PATH, "-hide_banner", "-y", "-i", src,
+             "-c", "copy", "-bsf:v", "hevc_mp4toannexb", "-f", "mpegts", ts_path],
+            check=False,
+        )
+        if result.returncode != 0 or not os.path.isfile(ts_path):
+            if result.stderr:
+                logger(result.stderr)
+            return False
+        ts_parts.append(ts_path)
+
+    ts_list = os.path.join(temp_dir, "ts_list.txt")
+    _write_concat_list(ts_list, ts_parts)
+    joined_ts = os.path.join(temp_dir, "joined.ts")
+    result = run_command(
+        [FFMPEG_PATH, "-hide_banner", "-y", "-f", "concat", "-safe", "0",
+         "-i", ts_list, "-c", "copy", joined_ts],
+        check=False,
+    )
+    if result.returncode != 0 or not os.path.isfile(joined_ts):
+        if result.stderr:
+            logger(result.stderr)
+        return False
+
+    on_stdout = (
+        make_progress_handler(expected_duration, progress_prefix)
+        if expected_duration > 0
+        else None
+    )
+    returncode, stderr_text = run_streaming(
+        [FFMPEG_PATH, "-hide_banner", "-y", "-i", joined_ts,
+         "-c", "copy", "-tag:v", "hev1", "-movflags", "+faststart",
+         "-progress", "pipe:1", "-nostats", out_path],
+        on_stdout=on_stdout,
+    )
+    if returncode != 0 or not os.path.isfile(out_path) or os.path.getsize(out_path) == 0:
+        if stderr_text.strip():
+            logger(stderr_text)
+        return False
+    if not _duration_ok(out_path, expected_duration):
+        logger("    - TS 拼接后时长异常。")
+        return False
+    if not _joins_ok(out_path, boundaries, logger):
+        logger("    - TS 拼接后拼接处仍有解码错误。")
+        return False
+    return True
+
+
+def merge_day_videos(out_path, items, logger, progress_prefix):
+    """把同一天的一组视频合并为 out_path，返回 'merged' / 'failed'。
+
+    items 为 (start, name, path) 列表，已按时间升序。
+    优先视频流复制（无损），音频按需统一转码；逐级兜底，最后整体重编码。
+    """
+    if len(items) == 1:
+        # 单文件的天也照样产出当天文件，直接复制一份。
+        shutil.copy2(items[0][2], out_path)
+        return "merged"
+
+    paths = [item[2] for item in items]
+    durations = [_probe_duration(path) for path in paths]
+    expected_duration = sum(durations)
+    boundaries = []
+    cumulative = 0.0
+    for duration in durations[:-1]:
+        cumulative += duration
+        boundaries.append(cumulative)
+
+    temp_dir = tempfile.mkdtemp(prefix="merge_day_")
+    try:
+        temp_output = os.path.join(temp_dir, "merged.mp4")
+        on_stdout = (
+            make_progress_handler(expected_duration, progress_prefix)
+            if expected_duration > 0
+            else None
+        )
+
+        raw_list = os.path.join(temp_dir, "concat_list.txt")
+        _write_concat_list(raw_list, paths)
+
+        signatures = []
+        for path in paths:
+            try:
+                signatures.append(_media_signature(path))
+            except Exception:
+                signatures = None
+                break
+
+        if signatures is None:
+            logger("    - 无法读取流信息，跳过该天。")
+            return "failed"
+
+        want_audio = any(sig[1] is not None for sig in signatures)
+        # 只有各段视频解码配置（参数集）完全一致，才能安全地流复制拼接；
+        # 否则（来自不同编码器 / 参数的片段）必须重编码，否则拼接处码流会解码错乱。
+        video_sigs = [sig[0] for sig in signatures]
+        video_copy_safe = (
+            all(sig is not None and sig[-1] is not None for sig in video_sigs)
+            and len(set(video_sigs)) == 1
+        )
+        if not video_copy_safe:
+            logger("    - 各段视频参数不一致（来自不同编码器），改用无损 TS 拼接（不重编码）。")
+
+        # 尝试一：视频 + 音频都完全一致时，直接流复制拼接（最快、无损）。
+        if video_copy_safe and len(set(signatures)) == 1:
+            if os.path.exists(temp_output):
+                os.remove(temp_output)
+            returncode, stderr_text = _concat_copy(raw_list, temp_output, on_stdout)
+            if (
+                returncode == 0
+                and _duration_ok(temp_output, expected_duration)
+                and _joins_ok(temp_output, boundaries, logger)
+            ):
+                shutil.move(temp_output, out_path)
+                return "merged"
+            logger("    - 直接流复制拼接不可靠，改用统一音频后拼接。")
+            if returncode != 0 and stderr_text.strip():
+                logger(stderr_text)
+
+        # 尝试二：视频参数一致时，先逐段统一音频（缺音轨补静音）再流复制拼接。
+        normalized = None
+        if video_copy_safe:
+            normalized = _normalize_all(paths, signatures, temp_dir, logger)
+            if normalized:
+                norm_list = os.path.join(temp_dir, "normalized_list.txt")
+                _write_concat_list(norm_list, normalized)
+                if os.path.exists(temp_output):
+                    os.remove(temp_output)
+                returncode, stderr_text = _concat_copy(norm_list, temp_output, on_stdout)
+                if (
+                    returncode == 0
+                    and _duration_ok(temp_output, expected_duration)
+                    and _joins_ok(temp_output, boundaries, logger)
+                ):
+                    shutil.move(temp_output, out_path)
+                    return "merged"
+                logger("    - 音频统一后拼接仍不可靠，改用无损 TS 拼接。")
+                if returncode != 0 and stderr_text.strip():
+                    logger(stderr_text)
+
+        # 尝试三：无损 TS 拼接（各段参数集不同也能拼，视频全程流复制，不重编码）。
+        if os.path.exists(temp_output):
+            os.remove(temp_output)
+        if _ts_join(
+            paths, signatures, temp_dir, logger, temp_output,
+            expected_duration, progress_prefix, boundaries,
+        ):
+            shutil.move(temp_output, out_path)
+            return "merged"
+        logger("    - 无损 TS 拼接不可用，回退整体重编码。")
+
+        # 尝试四：concat 滤镜整体重编码（最稳，但视频会有二次损失）。
+        if os.path.exists(temp_output):
+            os.remove(temp_output)
+        presence = [sig[1] is not None for sig in signatures]
+        audio_uniform = all(presence) or not any(presence)
+        reencode_inputs = paths
+        if not audio_uniform:
+            if normalized is None:
+                normalized = _normalize_all(paths, signatures, temp_dir, logger)
+            if normalized:
+                reencode_inputs = normalized
+        if _reencode_concat_filter(
+            reencode_inputs, want_audio, temp_output, logger,
+            expected_duration, progress_prefix,
+        ) and _duration_ok(temp_output, expected_duration):
+            shutil.move(temp_output, out_path)
+            return "merged"
+        logger("    - 合并重编码也失败，已跳过该天。")
+        return "failed"
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def merge_videos_by_day(source_paths, logger=log, delete_source=False):
+    """按天分组合并：每天一个 <YYYY-MM-DD>.mp4，输出到 OUTPUT_DIR/daily/。"""
+    groups, unparsed = group_videos_by_day(source_paths)
+    stats = {"merged": 0, "failed": 0, "skipped": 0}
+
+    for path in unparsed:
+        log(f"[合并] 跳过无法解析时间的文件: {os.path.basename(path)}")
+        stats["skipped"] += 1
+
+    if not groups:
+        log("[合并] 没有可按天合并的视频。")
+        return stats
+
+    dest_dir = daily_output_dir()
+    os.makedirs(dest_dir, exist_ok=True)
+
+    for day in sorted(groups):
+        CONTROL.checkpoint()
+        items = groups[day]
+        out_path = os.path.join(dest_dir, f"{day.isoformat()}.mp4")
+        log(f"[合并] {day.isoformat()}: {len(items)} 个文件 -> {out_path}")
+        prefix = f"[合并 {day.isoformat()}]    - "
+        try:
+            result = merge_day_videos(out_path, items, logger, prefix)
+        except JobCancelled:
+            raise
+        except Exception as exc:
+            log(f"[合并] {day.isoformat()} 失败: {exc}")
+            result = "failed"
+
+        if result == "merged":
+            stats["merged"] += 1
+            log(f"[合并] {day.isoformat()} 完成。")
+            if delete_source:
+                removed = 0
+                for _, _, path in items:
+                    # 只删自动合并产出的 compact_*，绝不误删其它来源。
+                    if os.path.basename(path).startswith("compact_"):
+                        try:
+                            os.remove(path)
+                            removed += 1
+                        except OSError:
+                            pass
+                if removed:
+                    log(f"[合并] 已删除 {removed} 个源文件。")
+        else:
+            stats["failed"] += 1
+
+    return stats
+
+
+def merge_outputs_by_day():
+    """自动合并：把 output 里的 compact_*.mp4 按天合并到 output/daily/。"""
+    ensure_output_dir()
+    source_paths = sorted(glob.glob(os.path.join(OUTPUT_DIR, "compact_*.mp4")))
+    if not source_paths:
+        log("[合并] output 中没有 compact_*.mp4，跳过按天合并。")
+        return
+    log(f"[合并] 开始按天合并 {len(source_paths)} 个输出文件（来源: {OUTPUT_DIR}）...")
+    stats = merge_videos_by_day(source_paths, logger=log, delete_source=DAILY_DELETE_SOURCE)
+    log(
+        f"[合并] 完成: 生成 {stats['merged']} 个按天文件，"
+        f"失败 {stats['failed']} 个，跳过 {stats['skipped']} 个。"
+    )
+    log(f"[合并] 输出目录: {daily_output_dir()}")
+
+
+def run_merge_only():
+    """手动合并：对输入目录里的视频按天合并到输出目录的 daily/（不删除输入文件）。"""
+    validate_environment()
+    ensure_output_dir()
+    video_files = list_input_videos()
+    if not video_files:
+        log(f"错误: 未在 {INPUT_DIR} 中找到 mp4 文件。")
+        return
+    log(f"[合并] 开始按天合并 {len(video_files)} 个视频（来源: {INPUT_DIR}）...")
+    stats = merge_videos_by_day(video_files, logger=log, delete_source=False)
+    log(
+        f"[合并] 完成: 生成 {stats['merged']} 个按天文件，"
+        f"失败 {stats['failed']} 个，跳过 {stats['skipped']} 个。"
+    )
+    log(f"[合并] 输出目录: {daily_output_dir()}")
+
+
 def run_pipeline():
     validate_environment()
     run_pipeline_tasks()
+    if MERGE_BY_DAY and not CONTROL.is_stopped():
+        merge_outputs_by_day()
 
