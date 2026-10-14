@@ -37,15 +37,17 @@ class VideoCompactApp:
         self.worker = None
         self.log_queue = queue.Queue()
         self.action_queue = queue.Queue()
+        self.event_queue = queue.Queue()
         self.tray_icon = None
         self.tray_thread = None
         self._running = False
+        self._last_summary = None
 
         root.title("小米摄像机录像压缩工具")
         scale = self._get_dpi_scale()
-        width, height = self._fit_to_screen(int(780 * scale), int(560 * scale))
+        width, height = self._fit_to_screen(int(800 * scale), int(640 * scale))
         root.geometry(f"{width}x{height}")
-        root.minsize(*self._fit_to_screen(int(720 * scale), int(520 * scale)))
+        root.minsize(*self._fit_to_screen(int(740 * scale), int(580 * scale)))
 
         icon_path = resource_path("app_icon.ico")
         if os.path.exists(icon_path):
@@ -56,6 +58,9 @@ class VideoCompactApp:
 
         self._build_ui()
         cv.set_log_sink(self.log_queue.put)
+        cv.set_event_sink(lambda evt, data: self.event_queue.put((evt, data)))
+        self._load_config()
+
         root.protocol("WM_DELETE_WINDOW", self.on_close)
         root.bind("<Unmap>", self.on_unmap)
         root.after(100, self._drain_log_queue)
@@ -138,13 +143,18 @@ class VideoCompactApp:
 
         ttk.Label(paths, text="输入目录:").grid(row=0, column=0, sticky="w", padx=8, pady=6)
         self.input_var = tk.StringVar(value=cv.INPUT_DIR)
-        ttk.Entry(paths, textvariable=self.input_var).grid(row=0, column=1, sticky="ew", padx=4)
+        self.input_entry = ttk.Entry(paths, textvariable=self.input_var)
+        self.input_entry.grid(row=0, column=1, sticky="ew", padx=4)
         ttk.Button(paths, text="浏览...", command=self.pick_input).grid(row=0, column=2, padx=8)
 
         ttk.Label(paths, text="输出目录:").grid(row=1, column=0, sticky="w", padx=8, pady=6)
         self.output_var = tk.StringVar(value=cv.OUTPUT_DIR)
-        ttk.Entry(paths, textvariable=self.output_var).grid(row=1, column=1, sticky="ew", padx=4)
+        self.output_entry = ttk.Entry(paths, textvariable=self.output_var)
+        self.output_entry.grid(row=1, column=1, sticky="ew", padx=4)
         ttk.Button(paths, text="浏览...", command=self.pick_output).grid(row=1, column=2, padx=8)
+
+        self._bind_path_entry_helpers(self.input_entry, self.input_var)
+        self._bind_path_entry_helpers(self.output_entry, self.output_var)
 
         self._build_advanced()
 
@@ -161,6 +171,24 @@ class VideoCompactApp:
         self.merge_btn.pack(side="left", padx=4)
         self.status_var = tk.StringVar(value="就绪")
         ttk.Label(controls, textvariable=self.status_var).pack(side="right", padx=8)
+
+        # 任务进度监控
+        progress_card = ttk.LabelFrame(self.root, text="任务进度")
+        progress_card.pack(fill="x", **pad)
+        self.progress_card = progress_card
+        progress_card.columnconfigure(1, weight=1)
+
+        ttk.Label(progress_card, text="总体进度:").grid(row=0, column=0, sticky="w", padx=8, pady=4)
+        self.total_progress = ttk.Progressbar(progress_card, orient="horizontal", mode="determinate")
+        self.total_progress.grid(row=0, column=1, sticky="ew", padx=4, pady=4)
+        self.total_progress_label = ttk.Label(progress_card, text="0 / 0 (0%)", width=16, anchor="e")
+        self.total_progress_label.grid(row=0, column=2, sticky="e", padx=8, pady=4)
+
+        ttk.Label(progress_card, text="当前视频:").grid(row=1, column=0, sticky="w", padx=8, pady=4)
+        self.curr_progress = ttk.Progressbar(progress_card, orient="horizontal", mode="determinate")
+        self.curr_progress.grid(row=1, column=1, sticky="ew", padx=4, pady=4)
+        self.curr_progress_label = ttk.Label(progress_card, text="0%", width=16, anchor="e")
+        self.curr_progress_label.grid(row=1, column=2, sticky="e", padx=8, pady=4)
 
         # footer 先用 side="bottom" 从底部预留空间，避免窗口空间不足时被日志框挤掉
         self._build_footer()
@@ -259,6 +287,69 @@ class VideoCompactApp:
         else:
             self.advanced.pack_forget()
 
+    # ---------------- 配置持久化与路径辅助 ----------------
+    def _bind_path_entry_helpers(self, entry, var):
+        def _clean_var(*_):
+            val = var.get().strip()
+            if (val.startswith('"') and val.endswith('"')) or (val.startswith("'") and val.endswith("'")):
+                var.set(val[1:-1].strip())
+        var.trace_add("write", _clean_var)
+
+        try:
+            entry.drop_target_register("DND_Files")
+            def _on_drop(e):
+                path_data = e.data.strip()
+                if path_data.startswith("{") and path_data.endswith("}"):
+                    path_data = path_data[1:-1]
+                path_data = path_data.strip('"').strip("'")
+                if os.path.isfile(path_data):
+                    path_data = os.path.dirname(path_data)
+                var.set(path_data)
+            entry.dnd_bind("<<Drop>>", _on_drop)
+        except Exception:
+            pass
+
+        menu = tk.Menu(entry, tearoff=0)
+        menu.add_command(label="剪切", command=lambda: entry.event_generate("<<Cut>>"))
+        menu.add_command(label="复制", command=lambda: entry.event_generate("<<Copy>>"))
+        menu.add_command(label="粘贴", command=lambda: entry.event_generate("<<Paste>>"))
+        menu.add_command(label="清空", command=lambda: var.set(""))
+        entry.bind("<Button-3>", lambda e: menu.tk_popup(e.x_root, e.y_root))
+
+    def _load_config(self):
+        cfg = cv.load_user_config()
+        if not cfg:
+            return
+        if "input_dir" in cfg and os.path.isdir(cfg["input_dir"]):
+            self.input_var.set(cfg["input_dir"])
+        if "output_dir" in cfg:
+            self.output_var.set(cfg["output_dir"])
+        if "output_mode" in cfg and cfg["output_mode"] in ("smart", "reencode", "lossless"):
+            self.mode_var.set(cfg["output_mode"])
+        if "merge_by_day" in cfg:
+            self.merge_var.set(bool(cfg["merge_by_day"]))
+        if "delete_source" in cfg:
+            self.delete_source_var.set(bool(cfg["delete_source"]))
+        if "static_min_seconds" in cfg:
+            self.static_min_var.set(str(cfg["static_min_seconds"]))
+        if "static_segment_mode" in cfg and cfg["static_segment_mode"] in ("drop", "speedup"):
+            self.segment_mode_var.set(cfg["static_segment_mode"])
+        if "static_speed" in cfg:
+            self.static_speed_var.set(str(cfg["static_speed"]))
+
+    def _save_config(self):
+        cfg = {
+            "input_dir": self.input_var.get().strip().strip('"'),
+            "output_dir": self.output_var.get().strip().strip('"'),
+            "output_mode": self.mode_var.get(),
+            "merge_by_day": bool(self.merge_var.get()),
+            "delete_source": bool(self.delete_source_var.get()),
+            "static_min_seconds": self.static_min_var.get().strip(),
+            "static_segment_mode": self.segment_mode_var.get(),
+            "static_speed": self.static_speed_var.get().strip(),
+        }
+        cv.save_user_config(cfg)
+
     # ---------------- actions ----------------
     def pick_input(self):
         path = filedialog.askdirectory(title="选择输入目录", initialdir=self.input_var.get() or cv.BASE_DIR)
@@ -289,7 +380,36 @@ class VideoCompactApp:
                 self._handle_action(action)
         except queue.Empty:
             pass
+        try:
+            while True:
+                event_name, data = self.event_queue.get_nowait()
+                self._handle_event(event_name, data)
+        except queue.Empty:
+            pass
         self.root.after(100, self._drain_log_queue)
+
+    def _handle_event(self, event_name, data):
+        if event_name == "task_progress":
+            completed = data.get("completed", 0)
+            total = data.get("total", 0)
+            if total > 0:
+                pct = int(completed / total * 100)
+                self.total_progress["value"] = pct
+                self.total_progress_label.configure(text=f"{completed} / {total} ({pct}%)")
+            else:
+                self.total_progress["value"] = 0
+                self.total_progress_label.configure(text="0 / 0 (0%)")
+            if completed < total:
+                self.curr_progress["value"] = 0
+                self.curr_progress_label.configure(text="0%")
+        elif event_name == "video_progress":
+            pct = data.get("percent", 0)
+            speed = data.get("speed", "")
+            self.curr_progress["value"] = pct
+            speed_str = f" ({speed})" if speed else ""
+            self.curr_progress_label.configure(text=f"{pct}%{speed_str}")
+        elif event_name == "task_summary":
+            self._last_summary = data
 
     def _handle_action(self, action):
         if action == "show":
@@ -366,6 +486,7 @@ class VideoCompactApp:
         cv.MERGE_BY_DAY = bool(self.merge_var.get())
         cv.DAILY_DELETE_SOURCE = bool(self.delete_source_var.get())
         cv.CONTROL.reset()
+        self._save_config()
 
         self._running = True
         self.start_btn.configure(state="disabled")
@@ -373,6 +494,10 @@ class VideoCompactApp:
         self.pause_btn.configure(state="normal", text="暂停")
         self.stop_btn.configure(state="normal")
         self.status_var.set("运行中")
+        self.total_progress["value"] = 0
+        self.total_progress_label.configure(text="准备中...")
+        self.curr_progress["value"] = 0
+        self.curr_progress_label.configure(text="0%")
 
         self.append_log("=" * 40)
         self.append_log(f"开始: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
@@ -448,6 +573,7 @@ class VideoCompactApp:
         cv.INPUT_DIR = input_dir
         cv.OUTPUT_DIR = output_dir
         cv.CONTROL.reset()
+        self._save_config()
 
         self._running = True
         self.start_btn.configure(state="disabled")
@@ -455,6 +581,10 @@ class VideoCompactApp:
         self.pause_btn.configure(state="normal", text="暂停")
         self.stop_btn.configure(state="normal")
         self.status_var.set("合并中")
+        self.total_progress["value"] = 0
+        self.total_progress_label.configure(text="准备中...")
+        self.curr_progress["value"] = 0
+        self.curr_progress_label.configure(text="0%")
 
         self.append_log("=" * 40)
         self.append_log(f"开始合并: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
@@ -484,6 +614,24 @@ class VideoCompactApp:
         self.pause_btn.configure(state="disabled", text="暂停")
         self.stop_btn.configure(state="disabled")
         self.status_var.set("就绪")
+        self.curr_progress["value"] = 100
+        self.curr_progress_label.configure(text="100%")
+
+        if self._last_summary and self._last_summary.get("total_source_bytes", 0) > 0:
+            s = self._last_summary
+            src_mb = s["total_source_bytes"] / (1024 * 1024)
+            out_mb = s["total_output_bytes"] / (1024 * 1024)
+            saved_mb = s["saved_bytes"] / (1024 * 1024)
+            ratio = s["saved_ratio"]
+            summary_msg = (
+                f"任务全部完成！\n\n"
+                f"处理文件: {s['success_count']} / {s['total_count']}\n"
+                f"源文件总体积: {src_mb:.1f} MB\n"
+                f"压缩后总体积: {out_mb:.1f} MB\n"
+                f"节省空间: {saved_mb:.1f} MB (节省率 {ratio:.1f}%)"
+            )
+            messagebox.showinfo("处理完成", summary_msg)
+            self._last_summary = None
 
     def toggle_pause(self):
         if not self._running:
@@ -570,9 +718,14 @@ class VideoCompactApp:
             )
             if not confirmed:
                 return
+        self._save_config()
         self._quit()
 
     def _quit(self):
+        try:
+            self._save_config()
+        except Exception:
+            pass
         cv.CONTROL.stop()
         if self.tray_icon is not None:
             try:
@@ -588,7 +741,11 @@ def main():
         ctypes.windll.shcore.SetProcessDpiAwareness(1)
     except Exception:
         pass
-    root = tk.Tk()
+    try:
+        from tkinterdnd2 import TkinterDnD
+        root = TkinterDnD.Tk()
+    except Exception:
+        root = tk.Tk()
     app = VideoCompactApp(root)
     root.mainloop()
 

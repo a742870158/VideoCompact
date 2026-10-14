@@ -13,6 +13,7 @@ detect/
 *.mp4
 *.empty
 *.tmp
+config.json
 
 # 编辑器 / IDE
 .idea/

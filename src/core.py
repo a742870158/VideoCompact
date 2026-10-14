@@ -103,11 +103,12 @@ ENCODE_PRESET = "p5"
 # CPU 编码（libx265）preset。fast 在速度与压缩率之间较均衡。
 ENCODE_CPU_PRESET = "fast"
 
-# 编码器候选链，按顺序尝试：NVIDIA NVENC -> AMD AMF -> CPU libx265。
+# 编码器候选链，按顺序尝试：NVIDIA NVENC -> AMD AMF -> Intel QSV -> CPU libx265。
 # 某个编码器编码失败后全局切换到下一个，后续文件直接使用可用的编码器。
 ENCODER_CANDIDATES = [
     {"name": "hevc_nvenc", "label": "NVIDIA NVENC"},
     {"name": "hevc_amf", "label": "AMD AMF"},
+    {"name": "hevc_qsv", "label": "Intel QSV"},
     {"name": "libx265", "label": "CPU libx265"},
 ]
 _ENCODER_STATE = {"index": 0}
@@ -167,12 +168,17 @@ _GPU_STATE = {"enabled": DETECTION_USE_GPU}
 _GPU_LOCK = threading.Lock()
 
 
-# ---------------- 日志回调 ----------------
+# ---------------- 日志与事件回调 ----------------
 _LOG_SINK = [print]
+_EVENT_SINK = [None]
 
 
 def set_log_sink(sink):
     _LOG_SINK[0] = sink
+
+
+def set_event_sink(sink):
+    _EVENT_SINK[0] = sink
 
 
 def log(message=""):
@@ -180,6 +186,59 @@ def log(message=""):
         _LOG_SINK[0](message)
     except Exception:
         pass
+
+
+def emit_event(event_type, **kwargs):
+    if _EVENT_SINK[0]:
+        try:
+            _EVENT_SINK[0](event_type, kwargs)
+        except Exception:
+            pass
+
+
+# ---------------- 配置持久化 ----------------
+CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
+
+
+def load_user_config():
+    if os.path.isfile(CONFIG_PATH):
+        try:
+            with open(CONFIG_PATH, "r", encoding="utf-8") as handle:
+                return json.load(handle)
+        except Exception:
+            return {}
+    return {}
+
+
+def save_user_config(config_dict):
+    try:
+        with open(CONFIG_PATH, "w", encoding="utf-8") as handle:
+            json.dump(config_dict, handle, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+
+# ---------------- 孤儿临时目录清理 ----------------
+def clean_stale_temp_dirs(max_age_hours=2):
+    """清理因异常终止或崩溃残留的 compact_video_* 临时文件夹。"""
+    temp_root = tempfile.gettempdir()
+    now = time.time()
+    cleaned = 0
+    try:
+        for entry in os.listdir(temp_root):
+            if entry.startswith("compact_video_") or entry.startswith("compact_video_ll_"):
+                dir_path = os.path.join(temp_root, entry)
+                if os.path.isdir(dir_path):
+                    try:
+                        mtime = os.path.getmtime(dir_path)
+                        if now - mtime > max_age_hours * 3600:
+                            shutil.rmtree(dir_path, ignore_errors=True)
+                            cleaned += 1
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+    return cleaned
 
 
 # ---------------- 暂停 / 继续 / 停止 ----------------
@@ -372,7 +431,14 @@ def run_streaming(cmd, on_stdout=None, on_stderr=None, capture_stderr=True):
 
 def make_progress_handler(total_seconds, prefix, min_pct=10, min_interval=15.0):
     # 解析 ffmpeg `-progress pipe:1` 输出，按百分比/时间节流地上报进度。
-    state = {"last_pct": 0, "last_t": time.time(), "speed": "", "emitted": False}
+    state = {
+        "last_pct": 0,
+        "last_t": time.time(),
+        "speed": "",
+        "emitted": False,
+        "last_ui_pct": -1,
+        "last_ui_t": 0.0,
+    }
 
     def handler(line):
         line = line.strip()
@@ -385,6 +451,14 @@ def make_progress_handler(total_seconds, prefix, min_pct=10, min_interval=15.0):
                 return
             pct = max(0, min(int(microseconds / (total_seconds * 1_000_000) * 100), 100))
             now = time.time()
+
+            # UI 进度条事件上报（每 1% 或 0.5s 触发一次，保持平滑）
+            if pct != state["last_ui_pct"] or now - state["last_ui_t"] >= 0.5:
+                state["last_ui_pct"] = pct
+                state["last_ui_t"] = now
+                emit_event("video_progress", percent=pct, prefix=prefix, speed=state["speed"])
+
+            # 控制台日志节流输出
             if (
                 not state["emitted"]
                 or pct >= state["last_pct"] + min_pct
@@ -785,6 +859,19 @@ def build_video_encoder_attempts(encoder, cq_value, maxrate):
                 )
             )
         return attempts
+
+    if encoder == "hevc_qsv":
+        args = [
+            "-c:v",
+            encoder,
+            "-preset",
+            "fast",
+            "-global_quality",
+            str(cq_value),
+        ]
+        if maxrate > 0:
+            args.extend(["-maxrate", str(maxrate), "-bufsize", str(maxrate * 2)])
+        return [("ICQ", args)]
 
     # libx265：CRF 定画质，VBV 限制峰值码率（单位 kbps）。
     args = [
@@ -1359,12 +1446,14 @@ def process_one_video(video_path):
 
 def run_pipeline_tasks():
     started_at = time.perf_counter()
+    clean_stale_temp_dirs()
     ensure_detect_dir()
     ensure_output_dir()
     video_files = list_input_videos()
 
     if not video_files:
         log(f"错误: 未在 {INPUT_DIR} 中找到 mp4 文件。")
+        emit_event("task_progress", completed=0, total=0)
         return
 
     pending_video_files = []
@@ -1380,44 +1469,137 @@ def run_pipeline_tasks():
         f"[任务] 找到 {len(video_files)} 个视频，"
         f"{len(pending_video_files)} 个待处理，{skipped_output_count} 个已有输出跳过。"
     )
+    emit_event("task_progress", completed=0, total=len(pending_video_files))
     if not pending_video_files:
         log("[任务] 无需处理。")
         return
 
-    log("[任务] 串行处理：每个任务 = 检测 + 编码，完成一个再进行下一个。")
+    log("[任务] 流水线处理：视频编码与下一视频静止检测并行交叠。")
 
     stats = {"lossless": 0, "reencoded": 0, "copied_fallback": 0, "copied_no_static": 0, "all_static": 0}
     failed_videos = []
     completed_count = 0
+    total_source_bytes = 0
+    total_output_bytes = 0
 
-    for video_path in pending_video_files:
-        try:
-            result = process_one_video(video_path)
-            if result == "cancelled":
+    prefetch_job = {"path": None, "thread": None, "result": [None], "error": [None]}
+
+    def _start_prefetch(target_path):
+        res_box = [None]
+        err_box = [None]
+
+        def _worker():
+            try:
+                res_box[0] = detect_one_video(target_path)
+            except JobCancelled:
+                res_box[0] = "cancelled"
+            except Exception as exc:
+                err_box[0] = exc
+                res_box[0] = "failed"
+
+        t = threading.Thread(target=_worker, name=f"PrefetchDetect-{os.path.basename(target_path)}", daemon=True)
+        t.start()
+        prefetch_job["path"] = target_path
+        prefetch_job["thread"] = t
+        prefetch_job["result"] = res_box
+        prefetch_job["error"] = err_box
+
+    try:
+        for idx, video_path in enumerate(pending_video_files):
+            filename = os.path.basename(video_path)
+            try:
+                CONTROL.checkpoint()
+            except JobCancelled:
                 log("[任务] 已停止。")
                 return
-            if result in stats:
-                stats[result] += 1
-            elif result == "failed":
-                failed_videos.append((os.path.basename(video_path), "检测失败"))
-        except JobCancelled:
-            log("[任务] 已停止。")
-            return
-        except Exception as exc:
-            failed_videos.append((os.path.basename(video_path), str(exc)))
-            log(f"[{os.path.basename(video_path)}]    - 失败: {exc}")
 
-        completed_count += 1
-        elapsed = time.perf_counter() - started_at
-        avg_per_video = elapsed / completed_count if completed_count else 0
-        remaining = len(pending_video_files) - completed_count
-        log(
-            f"[任务进度] {completed_count}/{len(pending_video_files)} 已完成, "
-            f"ETA 约 {format_eta(avg_per_video * remaining)}"
-        )
+            # --- 步骤 1：获取当前视频的静止检测结果 ---
+            detect_result = None
+            if prefetch_job["path"] == video_path and prefetch_job["thread"] is not None:
+                prefetch_job["thread"].join()
+                if prefetch_job["error"][0]:
+                    failed_videos.append((filename, str(prefetch_job["error"][0])))
+                    log(f"[{filename}]    - 预检测失败: {prefetch_job['error'][0]}")
+                    completed_count += 1
+                    continue
+                detect_result = prefetch_job["result"][0]
+                prefetch_job["path"] = None
+                prefetch_job["thread"] = None
+            else:
+                if not detection_is_fresh(video_path):
+                    detect_result = detect_one_video(video_path)
+                else:
+                    detect_result = "detected"
+
+            if detect_result == "cancelled":
+                log("[任务] 已停止。")
+                return
+            if detect_result == "failed":
+                failed_videos.append((filename, "检测失败"))
+                completed_count += 1
+                emit_event("task_progress", completed=completed_count, total=len(pending_video_files))
+                continue
+            if detect_result == "all_static":
+                stats["all_static"] += 1
+                completed_count += 1
+                emit_event("task_progress", completed=completed_count, total=len(pending_video_files))
+                continue
+
+            # --- 步骤 2：在当前视频编码期间，提前在后台检测下一个需要检测的视频 ---
+            next_target = None
+            for probe_idx in range(idx + 1, len(pending_video_files)):
+                candidate = pending_video_files[probe_idx]
+                if not detection_is_fresh(candidate):
+                    next_target = candidate
+                    break
+
+            if next_target and (prefetch_job["thread"] is None or not prefetch_job["thread"].is_alive()):
+                _start_prefetch(next_target)
+
+            # --- 步骤 3：主线程执行当前视频的编码 ---
+            try:
+                result = encode_one_video(video_path)
+                if result == "cancelled":
+                    log("[任务] 已停止。")
+                    return
+                if result in stats:
+                    stats[result] += 1
+                    try:
+                        src_sz = os.path.getsize(video_path)
+                        total_source_bytes += src_sz
+                        out_p = output_video_path(filename)
+                        if os.path.isfile(out_p):
+                            total_output_bytes += os.path.getsize(out_p)
+                        else:
+                            total_output_bytes += src_sz
+                    except Exception:
+                        pass
+                elif result == "failed":
+                    failed_videos.append((filename, "编码失败"))
+            except JobCancelled:
+                log("[任务] 已停止。")
+                return
+            except Exception as exc:
+                failed_videos.append((filename, str(exc)))
+                log(f"[{filename}]    - 失败: {exc}")
+
+            completed_count += 1
+            emit_event("task_progress", completed=completed_count, total=len(pending_video_files))
+            elapsed = time.perf_counter() - started_at
+            avg_per_video = elapsed / completed_count if completed_count else 0
+            remaining = len(pending_video_files) - completed_count
+            log(
+                f"[任务进度] {completed_count}/{len(pending_video_files)} 已完成, "
+                f"ETA 约 {format_eta(avg_per_video * remaining)}"
+            )
+    finally:
+        if prefetch_job["thread"] is not None and prefetch_job["thread"].is_alive():
+            prefetch_job["thread"].join(timeout=2)
 
     total_elapsed_seconds = int(time.perf_counter() - started_at)
     success_count = sum(stats.values())
+    saved_bytes = max(0, total_source_bytes - total_output_bytes)
+    saved_ratio = (saved_bytes / total_source_bytes * 100) if total_source_bytes > 0 else 0.0
 
     log("\n" + "=" * 36)
     log("[全部任务完成]")
@@ -1430,6 +1612,10 @@ def run_pipeline_tasks():
     log(f"  - 无静止区间直接复制: {stats['copied_no_static']}")
     log(f"  - 编码变大回退复制: {stats['copied_fallback']}")
     log(f"全静止跳过数: {stats['all_static']}")
+    if total_source_bytes > 0:
+        log(f"源文件总体积: {total_source_bytes / (1024 * 1024):.2f} MB")
+        log(f"输出文件总体积: {total_output_bytes / (1024 * 1024):.2f} MB")
+        log(f"节省空间: {saved_bytes / (1024 * 1024):.2f} MB (节省率 {saved_ratio:.1f}%)")
     log(f"总耗时(时分秒): {format_hms(total_elapsed_seconds)}")
     log(f"输出目录: {OUTPUT_DIR}")
     log(f"检测缓存目录: {DETECT_DIR}")
@@ -1440,6 +1626,16 @@ def run_pipeline_tasks():
     else:
         log("失败清单: 无")
     log("=" * 36)
+
+    emit_event(
+        "task_summary",
+        total_source_bytes=total_source_bytes,
+        total_output_bytes=total_output_bytes,
+        saved_bytes=saved_bytes,
+        saved_ratio=saved_ratio,
+        success_count=success_count,
+        total_count=len(pending_video_files),
+    )
 
 
 # ================= 阶段三：按天合并 =================
@@ -1941,6 +2137,9 @@ def merge_videos_by_day(source_paths, logger=log, delete_source=False):
 
     dest_dir = daily_output_dir()
     os.makedirs(dest_dir, exist_ok=True)
+    total_days = len(groups)
+    completed_days = 0
+    emit_event("task_progress", completed=0, total=total_days)
 
     for day in sorted(groups):
         CONTROL.checkpoint()
@@ -1973,6 +2172,9 @@ def merge_videos_by_day(source_paths, logger=log, delete_source=False):
                     log(f"[合并] 已删除 {removed} 个源文件。")
         else:
             stats["failed"] += 1
+
+        completed_days += 1
+        emit_event("task_progress", completed=completed_days, total=total_days)
 
     return stats
 
