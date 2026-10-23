@@ -2,8 +2,8 @@
 
 ![Example](./docs/example.png)
 
-[![Release](https://img.shields.io/github/v/release/waf2311/VideoCompact?label=release)](https://github.com/waf2311/VideoCompact/releases)
-[![License](https://img.shields.io/github/license/waf2311/VideoCompact)](./LICENSE)
+[![Release](https://img.shields.io/github/v/release/a742870158/VideoCompact?label=release)](https://github.com/a742870158/VideoCompact/releases)
+[![License](https://img.shields.io/github/license/a742870158/VideoCompact)](./LICENSE)
 ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20NVIDIA%20%7C%20AMD%20%7C%20CPU-blue)
 
 用于批量处理小米摄像机导出的 `H.265 / HEVC 4K mp4` 录像。
@@ -82,7 +82,7 @@ VideoCompact/
 
 ### 方式一：直接下载打包版（推荐，免 Python 环境）
 
-1. 打开 [Releases](https://github.com/waf2311/VideoCompact/releases) 下载最新的 `VideoCompact-*-win64.zip`
+1. 打开 [Releases](https://github.com/a742870158/VideoCompact/releases) 下载最新的 `VideoCompact-*-win64.zip`
 2. 解压后目录结构如下，双击 `VideoCompact.exe` 即可运行：
 
 ```text
@@ -212,7 +212,7 @@ winget install GitHub.GitLFS
 git lfs install
 
 # 克隆仓库（LFS 文件会自动拉取）
-git clone https://github.com/waf2311/VideoCompact.git
+git clone https://github.com/a742870158/VideoCompact.git
 cd VideoCompact
 
 # 解压随仓库提供的 ffmpeg（在根目录得到 ffmpeg.exe / ffprobe.exe）

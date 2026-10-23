@@ -30,7 +30,7 @@ def resource_path(name):
 
 
 class VideoCompactApp:
-    GITHUB_URL = "https://github.com/waf2311/VideoCompact"
+    GITHUB_URL = "https://github.com/a742870158/VideoCompact"
 
     def __init__(self, root):
         self.root = root
